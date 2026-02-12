@@ -77,20 +77,23 @@ def _ocr_one_page(img):
     return text, img
 
 
-def _ocr_retry_page(args):
+OCR_RETRY_DPI = int(os.environ.get("OCR_RETRY_DPI", "150"))
+
+
+def _ocr_retry_page(pdf_bytes, page_index, cropped_text):
     """Full-page OCR retry for an unmatched page.
 
-    Accepts (img, cropped_text) where cropped_text is the text from the
-    first pass (cropped top 25%).  Strategy:
-      1. Run full-page OCR at original orientation.
-      2. If the page had very little or garbled text in the first pass
-         (< 200 chars), also try 90°, 180°, 270° rotations and pick
-         the orientation with the most text.  This handles rotated pages.
-      3. Pages with substantial first-pass text (>= 200 chars) are NOT
-         rotated — they just had the reference below the crop line, so
-         a single full-page OCR at 0° is enough.
+    Re-renders the page at a higher DPI (150) for better OCR accuracy,
+    then runs full-page OCR.  If the first-pass cropped text was short
+    (< 200 chars, likely rotated), also tries 90/180/270 rotations and
+    picks the orientation with the most text.
     """
-    img, cropped_text = args
+    # Re-render this single page at higher DPI
+    imgs = convert_from_bytes(
+        pdf_bytes, dpi=OCR_RETRY_DPI,
+        first_page=page_index + 1, last_page=page_index + 1,
+    )
+    img = imgs[0]
 
     best_text = pytesseract.image_to_string(img, lang=OCR_LANGUAGES)
     best_img = img
@@ -578,12 +581,12 @@ def split_pdf_handler(request):
                      or _REF_HINTS.search(page_texts[idx]))
             ]
             if retry_indices:
-                log.info("Retry OCR for %d unmatched pages: %s",
-                         len(retry_indices), retry_indices)
+                log.info("Retry OCR for %d unmatched pages at %d DPI: %s",
+                         len(retry_indices), OCR_RETRY_DPI, retry_indices)
                 t0 = time.time()
                 for idx in retry_indices:
                     full_text, corrected_img = _ocr_retry_page(
-                        (corrected_images[idx], page_texts[idx])
+                        pdf_bytes, idx, page_texts[idx]
                     )
                     page_texts[idx] = full_text
                     corrected_images[idx] = corrected_img
@@ -592,6 +595,29 @@ def split_pdf_handler(request):
                 per_page_matches = find_references(
                     page_texts, reference_pattern, search_area
                 )
+
+                # 2c. Fallback: if retried pages still have no match, check
+                #     if the page text contains any reference already found
+                #     on other pages.  This handles multi-column OCR layouts
+                #     where the keyword (e.g. "Delivery Note:") and the
+                #     number end up on distant lines, breaking the regex.
+                known_refs = {
+                    m["reference"] for m in per_page_matches if m is not None
+                }
+                if known_refs:
+                    for idx in retry_indices:
+                        if per_page_matches[idx] is None:
+                            page_text_clean = re.sub(r'\s+', '', page_texts[idx])
+                            for ref in known_refs:
+                                if ref in page_text_clean:
+                                    log.info("Fallback match on page %d: "
+                                             "found known ref %s in text",
+                                             idx + 1, ref)
+                                    per_page_matches[idx] = {
+                                        "page_index": idx,
+                                        "reference": ref,
+                                    }
+                                    break
 
         if not any(m is not None for m in per_page_matches):
             hint = ""
