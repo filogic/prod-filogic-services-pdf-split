@@ -13,10 +13,15 @@ from __future__ import annotations
 import functions_framework
 import io
 import json
+import logging
 import os
 import re
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+
+log = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 import pdfplumber
 from pypdf import PdfReader, PdfWriter
@@ -146,7 +151,9 @@ def extract_text_per_page(
         return texts, "text", None
 
     try:
+        t0 = time.time()
         images = convert_from_bytes(pdf_bytes, dpi=OCR_DPI)
+        log.info("convert_from_bytes: %.1fs, %d pages", time.time() - t0, len(images))
     except Exception as e:
         if ocr_mode == "force":
             raise RuntimeError(f"OCR failed: {e}. Is poppler-utils installed?")
@@ -154,8 +161,11 @@ def extract_text_per_page(
         return texts, "text", None
 
     # ── First pass: parallel cropped OCR (no OSD) ─────────────
+    t0 = time.time()
     with ThreadPoolExecutor(max_workers=OCR_WORKERS) as pool:
         results = list(pool.map(_ocr_one_page, images))
+    log.info("First pass OCR: %.1fs (%d pages, %d workers)",
+             time.time() - t0, len(images), OCR_WORKERS)
 
     ocr_texts = [r[0] for r in results]
     page_images = [r[1] for r in results]  # originals (not rotated yet)
@@ -549,12 +559,16 @@ def split_pdf_handler(request):
                 if match is None and idx < len(corrected_images)
             ]
             if retry_indices:
+                log.info("Retry OCR for %d unmatched pages: %s",
+                         len(retry_indices), retry_indices)
                 retry_args = [
                     (corrected_images[i], page_texts[i])
                     for i in retry_indices
                 ]
+                t0 = time.time()
                 with ThreadPoolExecutor(max_workers=OCR_WORKERS) as pool:
                     retry_results = list(pool.map(_ocr_retry_page, retry_args))
+                log.info("Retry OCR done: %.1fs", time.time() - t0)
                 for idx, (full_text, corrected_img) in zip(retry_indices, retry_results):
                     page_texts[idx] = full_text
                     corrected_images[idx] = corrected_img
