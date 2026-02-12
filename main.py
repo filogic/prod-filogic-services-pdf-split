@@ -619,32 +619,9 @@ def split_pdf_handler(request):
                                     }
                                     break
 
-        if not any(m is not None for m in per_page_matches):
-            hint = ""
-            if extraction_method == "ocr":
-                hint = " (OCR was used)"
-            elif extraction_method == "text" and not any(len(t.strip()) > 10 for t in page_texts):
-                # Pages were empty — likely a scanned PDF
-                if not OCR_AVAILABLE:
-                    hint = (
-                        ". This appears to be a scanned PDF. OCR is required but "
-                        "poppler-utils is not installed. Install it with: "
-                        "apt-get install poppler-utils (Linux) or "
-                        "brew install poppler (macOS), or deploy with Docker "
-                        "(see Dockerfile)"
-                    )
-                else:
-                    hint = ". This may be a scanned PDF, try ocr='force'"
-            return make_error(
-                f"No references found matching pattern '{reference_pattern}'{hint}",
-                "NO_REFERENCES_FOUND",
-                404,
-                pages_scanned=total_pages,
-                extraction_method=extraction_method,
-                ocr_available=OCR_AVAILABLE,
-            )
-
         # 3. Group pages by reference
+        #    When no references are found at all, group_pages_by_reference
+        #    returns all pages as unmatched → they become "unknown.pdf".
         page_groups, unmatched_pages = group_pages_by_reference(
             per_page_matches, total_pages, split_mode
         )
