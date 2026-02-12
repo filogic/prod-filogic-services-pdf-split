@@ -1,0 +1,7 @@
+__pycache__
+*.pyc
+test_local.py
+README.md
+deploy.sh
+.dockerignore
+Dockerfile
