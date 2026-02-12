@@ -75,37 +75,23 @@ def _ocr_one_page(img):
 def _ocr_retry_page(img):
     """Full-page OCR with orientation detection for a single page.
 
-    Called only for pages where the first pass returned very little text
-    (likely rotated or reference is lower on the page).
-    Tries all four orientations if OSD confidence is low, picking the
-    rotation that yields the most text.
+    Called only for pages already flagged as problematic (very little
+    text or no long digit sequences).  Always tries all four orientations
+    and picks the one that yields the most text — this is the safest
+    strategy since we already know the first pass failed to produce a
+    useful result.
     """
+    # 0° (original orientation) — baseline
     best_text = pytesseract.image_to_string(img, lang=OCR_LANGUAGES)
     best_img = img
 
-    # Try OSD first
-    try:
-        osd = pytesseract.image_to_osd(img)
-        angle = int(osd.split("Rotate: ")[1].split("\n")[0])
-        conf = float(osd.split("Orientation confidence: ")[1].split("\n")[0])
-    except Exception:
-        angle, conf = 0, 0.0
-
-    if angle and conf >= 2.0:
-        # High confidence — just rotate and OCR
-        rotated = img.rotate(-angle, expand=True)
+    # Try 90°, 180°, 270° and keep whichever produces the most text
+    for test_angle in [90, 180, 270]:
+        rotated = img.rotate(-test_angle, expand=True)
         text = pytesseract.image_to_string(rotated, lang=OCR_LANGUAGES)
-        return text, rotated
-
-    if angle or len(best_text.strip()) < OCR_MIN_TEXT_LEN:
-        # Low confidence or very little text — try all 4 orientations,
-        # pick the one with the most readable text.
-        for test_angle in [90, 180, 270]:
-            rotated = img.rotate(-test_angle, expand=True)
-            text = pytesseract.image_to_string(rotated, lang=OCR_LANGUAGES)
-            if len(text.strip()) > len(best_text.strip()):
-                best_text = text
-                best_img = rotated
+        if len(text.strip()) > len(best_text.strip()):
+            best_text = text
+            best_img = rotated
 
     return best_text, best_img
 
