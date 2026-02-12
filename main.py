@@ -1,0 +1,488 @@
+"""
+Cloud Function: PDF Splitter by Reference
+Splits a PDF into multiple documents based on a reference pattern (e.g. order number)
+found in the text of each page. Supports both text-based and scanned (image) PDFs
+via OCR fallback (Tesseract).
+
+Deploy:
+  export GCP_PROJECT_ID=my-project
+  ./deploy.sh
+"""
+
+import functions_framework
+import io
+import json
+import os
+import re
+import uuid
+from datetime import datetime, timedelta, timezone
+
+import pdfplumber
+from pypdf import PdfReader, PdfWriter
+from google.cloud import storage
+
+# OCR imports — optional, only needed for scanned PDFs
+try:
+    import pytesseract
+    from pdf2image import convert_from_bytes
+    from pdf2image.exceptions import PDFInfoNotInstalledError
+    # Verify poppler is actually available (pdf2image needs it)
+    try:
+        convert_from_bytes(b'%PDF-1.0', dpi=72)
+    except PDFInfoNotInstalledError:
+        OCR_AVAILABLE = False
+    except Exception:
+        # Other errors (e.g. invalid PDF) are fine — poppler IS installed
+        OCR_AVAILABLE = True
+    else:
+        OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+GCS_BUCKET = os.environ.get("GCS_BUCKET", "pdf-splitter-output")
+SIGNED_URL_EXPIRY_MINUTES = int(os.environ.get("SIGNED_URL_EXPIRY_MINUTES", "60"))
+MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "20"))
+OUTPUT_PREFIX = os.environ.get("OUTPUT_PREFIX", "splits")
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+OCR_DPI = int(os.environ.get("OCR_DPI", "300"))
+OCR_LANGUAGES = os.environ.get("OCR_LANGUAGES", "nld+eng")
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def extract_text_per_page(pdf_bytes: bytes, ocr_mode: str = "auto") -> tuple[list[str], str]:
+    """
+    Extract text from each page.
+
+    ocr_mode:
+      - "auto": Try pdfplumber first; if ALL pages are empty, fall back to OCR.
+      - "force": Always use OCR (for scanned documents).
+      - "off": Only use pdfplumber (no OCR).
+
+    Returns (page_texts, method_used) where method_used is "text" or "ocr".
+    """
+    # ── Try text extraction first (unless force OCR) ──────────
+    if ocr_mode != "force":
+        texts = []
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text() or ""
+                texts.append(text)
+
+        # If we got meaningful text, use it
+        has_text = any(len(t.strip()) > 10 for t in texts)
+        if has_text or ocr_mode == "off":
+            return texts, "text"
+
+    # ── Fall back to OCR ──────────────────────────────────────
+    if not OCR_AVAILABLE:
+        if ocr_mode == "force":
+            raise RuntimeError(
+                "OCR is not available. Install poppler-utils and pytesseract, "
+                "or deploy with Docker (see Dockerfile)."
+            )
+        # auto mode: return empty texts with a warning — the caller will
+        # report NO_REFERENCES_FOUND with a helpful hint
+        return texts, "text"
+
+    try:
+        images = convert_from_bytes(pdf_bytes, dpi=OCR_DPI)
+    except Exception as e:
+        if ocr_mode == "force":
+            raise RuntimeError(f"OCR failed: {e}. Is poppler-utils installed?")
+        # auto mode: return empty texts
+        return texts, "text"
+
+    ocr_texts = []
+    for img in images:
+        text = pytesseract.image_to_string(img, lang=OCR_LANGUAGES)
+        ocr_texts.append(text)
+
+    return ocr_texts, "ocr"
+
+
+def find_references(
+    page_texts: list[str],
+    pattern: str,
+    search_area: str = "any",
+) -> list[dict]:
+    """
+    Find the *first* reference on each page.
+    Returns a list of {page_index, reference} dicts — one per page (or
+    None for pages with no match).
+    """
+    compiled = re.compile(pattern, re.IGNORECASE)
+    matches = []
+
+    for page_idx, text in enumerate(page_texts):
+        search_text = text
+        if search_area == "first_line":
+            search_text = text.split("\n")[0] if text else ""
+        elif search_area == "header":
+            lines = text.split("\n")
+            search_text = "\n".join(lines[:5]) if lines else ""
+
+        match = compiled.search(search_text)
+        if match:
+            # Use first capture group if available, otherwise full match
+            ref = match.group(1) if match.lastindex and match.lastindex >= 1 else match.group()
+            matches.append({"page_index": page_idx, "reference": ref})
+        else:
+            matches.append(None)
+
+    return matches
+
+
+def group_pages_by_reference(
+    per_page_matches: list[dict | None],
+    total_pages: int,
+    split_mode: str = "before_reference",
+) -> tuple[dict[str, list[int]], list[int]]:
+    """
+    Group pages into documents based on where references are found.
+
+    Key behaviour: a new document is created only when the reference
+    *changes*.  Continuation pages (same ref or no ref) are appended to
+    the current document.
+
+    split_mode:
+      - 'before_reference': A new document starts AT the page where a
+        *new* reference is found (most common: reference is on the first
+        page of each order).
+      - 'after_reference': A new document starts AFTER the page where a
+        *new* reference is found (reference is on a separator/cover page).
+
+    Returns:
+      - documents: {reference: [page_numbers (1-based)]}
+      - unmatched_pages: [page_numbers (1-based)] for pages before the
+        first reference
+    """
+    # Determine split points: pages where the reference CHANGES
+    split_points: list[dict] = []  # {page_index, reference}
+    current_ref = None
+
+    for entry in per_page_matches:
+        if entry is not None and entry["reference"] != current_ref:
+            split_points.append(entry)
+            current_ref = entry["reference"]
+
+    if not split_points:
+        return {}, list(range(1, total_pages + 1))
+
+    documents: dict[str, list[int]] = {}
+    unmatched_pages: list[int] = []
+    seen_refs: dict[str, int] = {}  # track duplicates
+
+    if split_mode == "before_reference":
+        # Pages before the first split point are unmatched
+        first_page = split_points[0]["page_index"]
+        if first_page > 0:
+            unmatched_pages = list(range(1, first_page + 1))
+
+        for i, sp in enumerate(split_points):
+            start = sp["page_index"]
+            end = split_points[i + 1]["page_index"] if i + 1 < len(split_points) else total_pages
+            pages = list(range(start + 1, end + 1))  # 1-based
+
+            ref = sp["reference"]
+            if ref in seen_refs:
+                seen_refs[ref] += 1
+                ref = f"{ref}_{seen_refs[ref]}"
+            else:
+                seen_refs[ref] = 1
+            documents[ref] = pages
+
+    elif split_mode == "after_reference":
+        first_page = split_points[0]["page_index"]
+        if first_page > 0:
+            unmatched_pages = list(range(1, first_page + 1))
+
+        for i, sp in enumerate(split_points):
+            start = sp["page_index"] + 1  # start AFTER the separator page
+            end = split_points[i + 1]["page_index"] if i + 1 < len(split_points) else total_pages
+            pages = list(range(start + 1, end + 1)) if start < end else []  # 1-based
+
+            ref = sp["reference"]
+            if ref in seen_refs:
+                seen_refs[ref] += 1
+                ref = f"{ref}_{seen_refs[ref]}"
+            else:
+                seen_refs[ref] = 1
+            documents[ref] = pages
+
+    return documents, unmatched_pages
+
+
+def split_pdf(pdf_bytes: bytes, page_groups: dict[str, list[int]]) -> dict[str, bytes]:
+    """Split a PDF into multiple PDFs based on page groups."""
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    result = {}
+
+    for reference, pages in page_groups.items():
+        if not pages:
+            continue
+        writer = PdfWriter()
+        for page_num in pages:
+            writer.add_page(reader.pages[page_num - 1])  # Convert to 0-based
+
+        buffer = io.BytesIO()
+        writer.write(buffer)
+        result[reference] = buffer.getvalue()
+
+    return result
+
+
+def upload_to_gcs(
+    split_pdfs: dict[str, bytes],
+    batch_id: str,
+) -> list[dict]:
+    """Upload split PDFs to GCS and return signed URLs."""
+    client = storage.Client()
+    bucket = client.bucket(GCS_BUCKET)
+    results = []
+
+    for reference, pdf_bytes in split_pdfs.items():
+        # Sanitize reference for use as filename
+        safe_ref = re.sub(r'[^\w\-.]', '_', reference)
+        blob_name = f"{OUTPUT_PREFIX}/{batch_id}/{safe_ref}.pdf"
+        blob = bucket.blob(blob_name)
+
+        blob.upload_from_string(pdf_bytes, content_type="application/pdf")
+
+        # Generate signed URL
+        signed_url = blob.generate_signed_url(
+            version="v4",
+            expiration=timedelta(minutes=SIGNED_URL_EXPIRY_MINUTES),
+            method="GET",
+        )
+
+        results.append({
+            "reference": reference,
+            "file_url": signed_url,
+            "gcs_path": f"gs://{GCS_BUCKET}/{blob_name}",
+            "file_size_bytes": len(pdf_bytes),
+        })
+
+    return results
+
+
+def make_error(message: str, error_code: str, status: int = 400, **extra):
+    """Create a JSON error response."""
+    body = {"status": "error", "error_code": error_code, "message": message, **extra}
+    return (json.dumps(body, ensure_ascii=False), status, {"Content-Type": "application/json"})
+
+
+def make_success(data: dict, status: int = 200):
+    """Create a JSON success response."""
+    body = {"status": "success", **data}
+    return (json.dumps(body, ensure_ascii=False), status, {"Content-Type": "application/json"})
+
+
+# ---------------------------------------------------------------------------
+# Cloud Function entry point
+# ---------------------------------------------------------------------------
+@functions_framework.http
+def split_pdf_handler(request):
+    """
+    HTTP Cloud Function.
+
+    Accepts multipart/form-data or application/json.
+
+    Multipart fields:
+      - file: PDF binary
+      - reference_pattern: regex pattern (required)
+      - split_mode: "before_reference" | "after_reference" (default: before_reference)
+      - search_area: "any" | "first_line" | "header" (default: any)
+
+    JSON body:
+      - file_base64: base64-encoded PDF
+      - filename: original filename
+      - reference_pattern: regex pattern (required)
+      - split_mode / search_area: same as above
+    """
+
+    # ---- CORS handling ----
+    if request.method == "OPTIONS":
+        return ("", 204, {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST",
+            "Access-Control-Allow-Headers": "Content-Type",
+            "Access-Control-Max-Age": "3600",
+        })
+
+    headers = {
+        "Access-Control-Allow-Origin": "*",
+        "Content-Type": "application/json",
+    }
+
+    if request.method != "POST":
+        return make_error("Only POST is allowed", "METHOD_NOT_ALLOWED", 405)
+
+    # ---- Parse input ----
+    content_type = request.content_type or ""
+    pdf_bytes = None
+    filename = "unknown.pdf"
+    reference_pattern = None
+    split_mode = "before_reference"
+    search_area = "any"
+    ocr_mode = "auto"
+
+    try:
+        if "multipart/form-data" in content_type:
+            file = request.files.get("file")
+            if not file:
+                return make_error("Missing 'file' in form data", "MISSING_FILE")
+            pdf_bytes = file.read()
+            filename = file.filename or filename
+            reference_pattern = request.form.get("reference_pattern")
+            split_mode = request.form.get("split_mode", split_mode)
+            search_area = request.form.get("search_area", search_area)
+            ocr_mode = request.form.get("ocr", ocr_mode)
+
+        elif "application/json" in content_type:
+            import base64
+            body = request.get_json(silent=True) or {}
+            file_b64 = body.get("file_base64")
+            if not file_b64:
+                return make_error("Missing 'file_base64' in JSON body", "MISSING_FILE")
+            pdf_bytes = base64.b64decode(file_b64)
+            filename = body.get("filename", filename)
+            reference_pattern = body.get("reference_pattern")
+            split_mode = body.get("split_mode", split_mode)
+            search_area = body.get("search_area", search_area)
+            ocr_mode = body.get("ocr", ocr_mode)
+
+        else:
+            return make_error(
+                "Content-Type must be multipart/form-data or application/json",
+                "INVALID_CONTENT_TYPE",
+                415,
+            )
+    except Exception as e:
+        return make_error(f"Failed to parse request: {e}", "PARSE_ERROR")
+
+    # ---- Validate ----
+    if not reference_pattern:
+        return make_error("'reference_pattern' is required", "MISSING_PATTERN")
+
+    try:
+        re.compile(reference_pattern)
+    except re.error as e:
+        return make_error(f"Invalid regex pattern: {e}", "INVALID_PATTERN")
+
+    if split_mode not in ("before_reference", "after_reference"):
+        return make_error(
+            "split_mode must be 'before_reference' or 'after_reference'",
+            "INVALID_SPLIT_MODE",
+        )
+
+    if search_area not in ("any", "first_line", "header"):
+        return make_error(
+            "search_area must be 'any', 'first_line', or 'header'",
+            "INVALID_SEARCH_AREA",
+        )
+
+    if ocr_mode not in ("auto", "force", "off"):
+        return make_error(
+            "ocr must be 'auto', 'force', or 'off'",
+            "INVALID_OCR_MODE",
+        )
+
+    if ocr_mode == "force" and not OCR_AVAILABLE:
+        return make_error(
+            "OCR is not available. Deploy with Docker for Tesseract support, "
+            "or use ocr='auto' to try text extraction first.",
+            "OCR_NOT_AVAILABLE",
+        )
+
+    file_size_mb = len(pdf_bytes) / (1024 * 1024)
+    if file_size_mb > MAX_FILE_SIZE_MB:
+        return make_error(
+            f"File too large: {file_size_mb:.1f}MB (max {MAX_FILE_SIZE_MB}MB)",
+            "FILE_TOO_LARGE",
+        )
+
+    # ---- Process ----
+    try:
+        # 1. Extract text from each page (with OCR fallback)
+        page_texts, extraction_method = extract_text_per_page(pdf_bytes, ocr_mode)
+        total_pages = len(page_texts)
+
+        if total_pages == 0:
+            return make_error("PDF has no pages", "EMPTY_PDF")
+
+        # 2. Find references per page
+        per_page_matches = find_references(page_texts, reference_pattern, search_area)
+
+        if not any(m is not None for m in per_page_matches):
+            hint = ""
+            if extraction_method == "ocr":
+                hint = " (OCR was used)"
+            elif extraction_method == "text" and not any(len(t.strip()) > 10 for t in page_texts):
+                # Pages were empty — likely a scanned PDF
+                if not OCR_AVAILABLE:
+                    hint = (
+                        ". This appears to be a scanned PDF. OCR is required but "
+                        "poppler-utils is not installed. Install it with: "
+                        "apt-get install poppler-utils (Linux) or "
+                        "brew install poppler (macOS), or deploy with Docker "
+                        "(see Dockerfile)"
+                    )
+                else:
+                    hint = ". This may be a scanned PDF, try ocr='force'"
+            return make_error(
+                f"No references found matching pattern '{reference_pattern}'{hint}",
+                "NO_REFERENCES_FOUND",
+                404,
+                pages_scanned=total_pages,
+                extraction_method=extraction_method,
+                ocr_available=OCR_AVAILABLE,
+            )
+
+        # 3. Group pages by reference
+        page_groups, unmatched_pages = group_pages_by_reference(
+            per_page_matches, total_pages, split_mode
+        )
+
+        # 4. Split the PDF
+        split_pdfs = split_pdf(pdf_bytes, page_groups)
+
+        # 5. Upload to GCS
+        batch_id = datetime.now(timezone.utc).strftime("%Y%m%d") + "_" + uuid.uuid4().hex[:8]
+        uploaded = upload_to_gcs(split_pdfs, batch_id)
+
+        # 6. Build response
+        documents = []
+        for upload_info in uploaded:
+            ref = upload_info["reference"]
+            pages = page_groups.get(ref, [])
+            documents.append({
+                "reference": ref,
+                "pages": pages,
+                "page_count": len(pages),
+                "file_url": upload_info["file_url"],
+                "gcs_path": upload_info["gcs_path"],
+                "file_size_bytes": upload_info["file_size_bytes"],
+            })
+
+        return make_success({
+            "batch_id": batch_id,
+            "source_filename": filename,
+            "total_pages": total_pages,
+            "documents_count": len(documents),
+            "documents": documents,
+            "unmatched_pages": unmatched_pages,
+            "extraction_method": extraction_method,
+            "signed_url_expires_in_minutes": SIGNED_URL_EXPIRY_MINUTES,
+        })
+
+    except Exception as e:
+        return make_error(f"Processing failed: {e}", "PROCESSING_ERROR", 500)
