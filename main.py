@@ -277,6 +277,18 @@ def group_pages_by_reference(
     return documents, unmatched_pages
 
 
+def merge_pdfs(pdf_list: list[bytes]) -> bytes:
+    """Merge multiple PDFs into a single PDF."""
+    writer = PdfWriter()
+    for pdf_bytes in pdf_list:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        for page in reader.pages:
+            writer.add_page(page)
+    buffer = io.BytesIO()
+    writer.write(buffer)
+    return buffer.getvalue()
+
+
 def split_pdf(pdf_bytes: bytes, page_groups: dict[str, list[int]]) -> dict[str, bytes]:
     """Split a PDF into multiple PDFs based on page groups."""
     reader = PdfReader(io.BytesIO(pdf_bytes))
@@ -344,16 +356,19 @@ def split_pdf_handler(request):
     Accepts multipart/form-data or application/json.
 
     Multipart fields:
-      - file: PDF binary
+      - file: one or more PDF binaries (multiple files supported)
       - reference_pattern: regex pattern (required)
       - split_mode: "before_reference" | "after_reference" (default: before_reference)
       - search_area: "any" | "first_line" | "header" (default: any)
 
     JSON body:
-      - file_base64: base64-encoded PDF
+      - file_base64: base64-encoded PDF (string or list of strings)
       - filename: original filename
       - reference_pattern: regex pattern (required)
       - split_mode / search_area: same as above
+
+    When multiple files are provided they are merged into a single PDF
+    before splitting by reference.
     """
 
     # ---- CORS handling ----
@@ -384,11 +399,17 @@ def split_pdf_handler(request):
 
     try:
         if "multipart/form-data" in content_type:
-            file = request.files.get("file")
-            if not file:
+            files = request.files.getlist("file")
+            if not files:
                 return make_error("Missing 'file' in form data", "MISSING_FILE")
-            pdf_bytes = file.read()
-            filename = file.filename or filename
+            if len(files) == 1:
+                pdf_bytes = files[0].read()
+                filename = files[0].filename or filename
+            else:
+                # Multiple files — merge into a single PDF
+                pdf_list = [f.read() for f in files]
+                pdf_bytes = merge_pdfs(pdf_list)
+                filename = "merged.pdf"
             reference_pattern = request.form.get("reference_pattern")
             split_mode = request.form.get("split_mode", split_mode)
             search_area = request.form.get("search_area", search_area)
@@ -400,7 +421,13 @@ def split_pdf_handler(request):
             file_b64 = body.get("file_base64")
             if not file_b64:
                 return make_error("Missing 'file_base64' in JSON body", "MISSING_FILE")
-            pdf_bytes = base64.b64decode(file_b64)
+            if isinstance(file_b64, list):
+                # Multiple files — merge into a single PDF
+                pdf_list = [base64.b64decode(b) for b in file_b64]
+                pdf_bytes = merge_pdfs(pdf_list)
+                filename = "merged.pdf"
+            else:
+                pdf_bytes = base64.b64decode(file_b64)
             filename = body.get("filename", filename)
             reference_pattern = body.get("reference_pattern")
             split_mode = body.get("split_mode", split_mode)
