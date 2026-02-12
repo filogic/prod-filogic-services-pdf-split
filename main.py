@@ -356,7 +356,7 @@ def split_pdf_handler(request):
     Accepts multipart/form-data or application/json.
 
     Multipart fields:
-      - file: one or more PDF binaries (multiple files supported)
+      - file (or file[] or files): one or more PDF binaries
       - reference_pattern: regex pattern (required)
       - split_mode: "before_reference" | "after_reference" (default: before_reference)
       - search_area: "any" | "first_line" | "header" (default: any)
@@ -399,7 +399,12 @@ def split_pdf_handler(request):
 
     try:
         if "multipart/form-data" in content_type:
-            files = request.files.getlist("file")
+            # Accept field name "file", "file[]", or "files"
+            files = (
+                request.files.getlist("file")
+                or request.files.getlist("file[]")
+                or request.files.getlist("files")
+            )
             if not files:
                 return make_error("Missing 'file' in form data", "MISSING_FILE")
             if len(files) == 1:
