@@ -51,8 +51,9 @@ OUTPUT_PREFIX = os.environ.get("OUTPUT_PREFIX", "splits")
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-OCR_DPI = int(os.environ.get("OCR_DPI", "300"))
+OCR_DPI = int(os.environ.get("OCR_DPI", "72"))
 OCR_LANGUAGES = os.environ.get("OCR_LANGUAGES", "nld+eng")
+OCR_CROP_TOP_PCT = float(os.environ.get("OCR_CROP_TOP_PCT", "0.25"))
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +104,12 @@ def extract_text_per_page(pdf_bytes: bytes, ocr_mode: str = "auto") -> tuple[lis
 
     ocr_texts = []
     for img in images:
+        # Crop to top portion only — references (order numbers, vrachtbrief
+        # numbers etc.) are virtually always in the page header. This cuts
+        # OCR time by ~80% compared to scanning the full page.
+        if OCR_CROP_TOP_PCT < 1.0:
+            w, h = img.size
+            img = img.crop((0, 0, w, int(h * OCR_CROP_TOP_PCT)))
         text = pytesseract.image_to_string(img, lang=OCR_LANGUAGES)
         ocr_texts.append(text)
 
