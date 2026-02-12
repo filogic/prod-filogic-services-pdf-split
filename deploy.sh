@@ -41,6 +41,8 @@ gcloud run deploy "${SERVICE_NAME}" \
     --memory 2Gi \
     --cpu 2 \
     --concurrency 1 \
+    --cpu-boost \
+    --min-instances 1 \
     --timeout 300s \
     --max-instances 10 \
     --set-env-vars "GCS_BUCKET=${GCS_BUCKET}"

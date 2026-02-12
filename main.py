@@ -24,19 +24,14 @@ from google.cloud import storage
 
 # OCR imports — optional, only needed for scanned PDFs
 try:
+    import shutil
     import pytesseract
     from pdf2image import convert_from_bytes
-    from pdf2image.exceptions import PDFInfoNotInstalledError
-    # Verify poppler is actually available (pdf2image needs it)
-    try:
-        convert_from_bytes(b'%PDF-1.0', dpi=72)
-    except PDFInfoNotInstalledError:
-        OCR_AVAILABLE = False
-    except Exception:
-        # Other errors (e.g. invalid PDF) are fine — poppler IS installed
-        OCR_AVAILABLE = True
-    else:
-        OCR_AVAILABLE = True
+    # Lightweight check: just verify the binaries exist on PATH
+    # (avoids slow convert_from_bytes probe on every cold start)
+    OCR_AVAILABLE = bool(
+        shutil.which("tesseract") and shutil.which("pdftoppm")
+    )
 except ImportError:
     OCR_AVAILABLE = False
 
