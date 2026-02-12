@@ -16,6 +16,7 @@ import json
 import os
 import re
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 import pdfplumber
 from pypdf import PdfReader, PdfWriter
@@ -49,14 +50,71 @@ MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "20"))
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-OCR_DPI = int(os.environ.get("OCR_DPI", "150"))
+OCR_DPI = int(os.environ.get("OCR_DPI", "120"))
 OCR_LANGUAGES = os.environ.get("OCR_LANGUAGES", "nld+eng")
-OCR_CROP_TOP_PCT = float(os.environ.get("OCR_CROP_TOP_PCT", "0.50"))
+OCR_CROP_TOP_PCT = float(os.environ.get("OCR_CROP_TOP_PCT", "0.25"))
+OCR_WORKERS = int(os.environ.get("OCR_WORKERS", "4"))
+# Minimum text length from cropped OCR to consider the page "readable".
+# Pages below this threshold get orientation detection + full-page retry.
+OCR_MIN_TEXT_LEN = int(os.environ.get("OCR_MIN_TEXT_LEN", "20"))
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def _ocr_one_page(img):
+    """OCR a single page image: crop to top portion, return (text, img).
+
+    No orientation detection here — that is deferred to the retry pass
+    for pages that produce very little text (keeps the fast path fast).
+    """
+    if OCR_CROP_TOP_PCT < 1.0:
+        w, h = img.size
+        cropped = img.crop((0, 0, w, int(h * OCR_CROP_TOP_PCT)))
+    else:
+        cropped = img
+    text = pytesseract.image_to_string(cropped, lang=OCR_LANGUAGES)
+    return text, img
+
+
+def _ocr_retry_page(img):
+    """Full-page OCR with orientation detection for a single page.
+
+    Called only for pages where the first pass returned very little text
+    (likely rotated or reference is lower on the page).
+    Tries all four orientations if OSD confidence is low, picking the
+    rotation that yields the most text.
+    """
+    best_text = pytesseract.image_to_string(img, lang=OCR_LANGUAGES)
+    best_img = img
+
+    # Try OSD first
+    try:
+        osd = pytesseract.image_to_osd(img)
+        angle = int(osd.split("Rotate: ")[1].split("\n")[0])
+        conf = float(osd.split("Orientation confidence: ")[1].split("\n")[0])
+    except Exception:
+        angle, conf = 0, 0.0
+
+    if angle and conf >= 2.0:
+        # High confidence — just rotate and OCR
+        rotated = img.rotate(-angle, expand=True)
+        text = pytesseract.image_to_string(rotated, lang=OCR_LANGUAGES)
+        return text, rotated
+
+    if angle or len(best_text.strip()) < OCR_MIN_TEXT_LEN:
+        # Low confidence or very little text — try all 4 orientations,
+        # pick the one with the most readable text.
+        for test_angle in [90, 180, 270]:
+            rotated = img.rotate(-test_angle, expand=True)
+            text = pytesseract.image_to_string(rotated, lang=OCR_LANGUAGES)
+            if len(text.strip()) > len(best_text.strip()):
+                best_text = text
+                best_img = rotated
+
+    return best_text, best_img
+
+
 def extract_text_per_page(
     pdf_bytes: bytes,
     ocr_mode: str = "auto",
@@ -107,38 +165,35 @@ def extract_text_per_page(
         # auto mode: return empty texts
         return texts, "text", None
 
-    corrected_images = []
-    ocr_texts = []
-    for img in images:
-        # Auto-detect and correct page orientation before OCR.
-        # Scanned documents are sometimes rotated 90/180/270 degrees.
-        try:
-            osd = pytesseract.image_to_osd(img)
-            angle = int(osd.split("Rotate: ")[1].split("\n")[0])
-            if angle:
-                img = img.rotate(-angle, expand=True)
-        except Exception:
-            pass  # OSD can fail on blank or low-contrast pages
+    # ── First pass: parallel cropped OCR (no OSD) ─────────────
+    with ThreadPoolExecutor(max_workers=OCR_WORKERS) as pool:
+        results = list(pool.map(_ocr_one_page, images))
 
-        corrected_images.append(img)
+    ocr_texts = [r[0] for r in results]
+    page_images = [r[1] for r in results]  # originals (not rotated yet)
 
-        # Crop to top portion only — references (order numbers, vrachtbrief
-        # numbers etc.) are virtually always in the page header. This cuts
-        # OCR time by ~80% compared to scanning the full page.
-        if OCR_CROP_TOP_PCT < 1.0:
-            w, h = img.size
-            cropped = img.crop((0, 0, w, int(h * OCR_CROP_TOP_PCT)))
-        else:
-            cropped = img
-        text = pytesseract.image_to_string(cropped, lang=OCR_LANGUAGES)
-        ocr_texts.append(text)
+    # ── Second pass: retry pages that look problematic ──────────
+    # Pages with very little text are likely rotated or blank.
+    # Pages with some text but no 9+ digit numbers AND the text is
+    # short (< 200 chars) are likely rotated — garbled OCR from wrong
+    # orientation can produce short digit sequences like "000081" but
+    # rarely long ones matching typical reference numbers (9-10 digits).
+    # We cap at 200 chars to avoid retrying content-rich detail pages
+    # that simply don't carry a reference number.
+    retry_indices = [
+        i for i, text in enumerate(ocr_texts)
+        if len(text.strip()) < OCR_MIN_TEXT_LEN
+        or (not re.search(r'\d{9,}', text) and len(text.strip()) < 200)
+    ]
+    if retry_indices:
+        retry_images = [page_images[i] for i in retry_indices]
+        with ThreadPoolExecutor(max_workers=OCR_WORKERS) as pool:
+            retry_results = list(pool.map(_ocr_retry_page, retry_images))
+        for idx, (text, corrected_img) in zip(retry_indices, retry_results):
+            ocr_texts[idx] = text
+            page_images[idx] = corrected_img
 
-    return ocr_texts, "ocr", corrected_images
-
-
-def ocr_full_page(img) -> str:
-    """Run OCR on a full (uncropped) orientation-corrected page image."""
-    return pytesseract.image_to_string(img, lang=OCR_LANGUAGES)
+    return ocr_texts, "ocr", page_images
 
 
 def find_references(
@@ -516,19 +571,37 @@ def split_pdf_handler(request):
         per_page_matches = find_references(page_texts, reference_pattern, search_area)
 
         # 2b. For OCR pages with no match, retry with full-page OCR.
-        #     The initial OCR only scans the top portion of each page
-        #     for speed; some documents have references lower on the
-        #     page.  Re-OCR only the unmatched pages (full page) to
-        #     avoid slowing down the common case.
+        #     The first pass only scanned the top portion; some docs
+        #     have references lower on the page.  Only retry pages
+        #     whose cropped text contains reference-like keywords
+        #     (suggesting the number is just below the crop line).
+        #     This avoids wasting time on pure detail/table pages.
+        _REF_HINTS = re.compile(
+            r"vrachtbrief|vrachtnota|delivery|reference|shipment|"
+            r"zending|vrachtbr|consignment",
+            re.IGNORECASE,
+        )
         if corrected_images and OCR_CROP_TOP_PCT < 1.0:
-            for idx, match in enumerate(per_page_matches):
-                if match is None and idx < len(corrected_images):
-                    full_text = ocr_full_page(corrected_images[idx])
-                    page_texts[idx] = full_text
-            # Re-run reference matching with the updated texts
-            per_page_matches = find_references(
-                page_texts, reference_pattern, search_area
-            )
+            retry_indices = [
+                idx for idx, match in enumerate(per_page_matches)
+                if match is None
+                and idx < len(corrected_images)
+                and _REF_HINTS.search(page_texts[idx])
+            ]
+            if retry_indices:
+                def _full_ocr(idx):
+                    return idx, pytesseract.image_to_string(
+                        corrected_images[idx], lang=OCR_LANGUAGES
+                    )
+                with ThreadPoolExecutor(max_workers=OCR_WORKERS) as pool:
+                    for idx, full_text in pool.map(
+                        lambda i: _full_ocr(i), retry_indices
+                    ):
+                        page_texts[idx] = full_text
+                # Re-run reference matching with the updated texts
+                per_page_matches = find_references(
+                    page_texts, reference_pattern, search_area
+                )
 
         if not any(m is not None for m in per_page_matches):
             hint = ""
