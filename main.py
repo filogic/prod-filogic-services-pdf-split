@@ -15,7 +15,6 @@ import json
 import os
 import re
 import uuid
-from datetime import datetime, timezone
 
 import pdfplumber
 from pypdf import PdfReader, PdfWriter
@@ -44,7 +43,6 @@ except ImportError:
 # ---------------------------------------------------------------------------
 GCS_BUCKET = os.environ.get("GCS_BUCKET", "pdf-splitter-output")
 MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "20"))
-OUTPUT_PREFIX = os.environ.get("OUTPUT_PREFIX", "splits")
 
 
 # ---------------------------------------------------------------------------
@@ -248,23 +246,24 @@ def split_pdf(pdf_bytes: bytes, page_groups: dict[str, list[int]]) -> dict[str, 
 
 def upload_to_gcs(
     split_pdfs: dict[str, bytes],
-    batch_id: str,
 ) -> list[dict]:
-    """Upload split PDFs to GCS and return GCS paths."""
+    """Upload split PDFs to GCS as .tmp files, return document list."""
     client = storage.Client()
     bucket = client.bucket(GCS_BUCKET)
     results = []
 
     for reference, pdf_bytes in split_pdfs.items():
-        safe_ref = re.sub(r'[^\w\-.]', '_', reference)
-        blob_name = f"{OUTPUT_PREFIX}/{batch_id}/{safe_ref}.pdf"
+        blob_name = f"{uuid.uuid4().hex}.tmp"
         blob = bucket.blob(blob_name)
-
         blob.upload_from_string(pdf_bytes, content_type="application/pdf")
 
+        safe_ref = re.sub(r'[^\w\-.]', '_', reference)
         results.append({
             "reference": reference,
+            "filename": f"{safe_ref}.pdf",
             "gcs_path": f"gs://{GCS_BUCKET}/{blob_name}",
+            "pages": [],          # filled in by caller
+            "page_count": 0,      # filled in by caller
             "file_size_bytes": len(pdf_bytes),
         })
 
@@ -277,10 +276,9 @@ def make_error(message: str, error_code: str, status: int = 400, **extra):
     return (json.dumps(body, ensure_ascii=False), status, {"Content-Type": "application/json"})
 
 
-def make_success(data: dict, status: int = 200):
+def make_success(data, status: int = 200):
     """Create a JSON success response."""
-    body = {"status": "success", **data}
-    return (json.dumps(body, ensure_ascii=False), status, {"Content-Type": "application/json"})
+    return (json.dumps(data, ensure_ascii=False), status, {"Content-Type": "application/json"})
 
 
 # ---------------------------------------------------------------------------
@@ -453,31 +451,16 @@ def split_pdf_handler(request):
         split_pdfs = split_pdf(pdf_bytes, page_groups)
 
         # 5. Upload to GCS
-        batch_id = datetime.now(timezone.utc).strftime("%Y%m%d") + "_" + uuid.uuid4().hex[:8]
-        uploaded = upload_to_gcs(split_pdfs, batch_id)
+        uploaded = upload_to_gcs(split_pdfs)
 
-        # 6. Build response
-        documents = []
-        for upload_info in uploaded:
-            ref = upload_info["reference"]
-            pages = page_groups.get(ref, [])
-            documents.append({
-                "reference": ref,
-                "pages": pages,
-                "page_count": len(pages),
-                "gcs_path": upload_info["gcs_path"],
-                "file_size_bytes": upload_info["file_size_bytes"],
-            })
+        # 6. Enrich with page info
+        ref_to_pages = page_groups
+        for doc in uploaded:
+            pages = ref_to_pages.get(doc["reference"], [])
+            doc["pages"] = pages
+            doc["page_count"] = len(pages)
 
-        return make_success({
-            "batch_id": batch_id,
-            "source_filename": filename,
-            "total_pages": total_pages,
-            "documents_count": len(documents),
-            "documents": documents,
-            "unmatched_pages": unmatched_pages,
-            "extraction_method": extraction_method,
-        })
+        return make_success(uploaded)
 
     except Exception as e:
         return make_error(f"Processing failed: {e}", "PROCESSING_ERROR", 500)
