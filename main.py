@@ -49,9 +49,9 @@ MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "20"))
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-OCR_DPI = int(os.environ.get("OCR_DPI", "72"))
+OCR_DPI = int(os.environ.get("OCR_DPI", "150"))
 OCR_LANGUAGES = os.environ.get("OCR_LANGUAGES", "nld+eng")
-OCR_CROP_TOP_PCT = float(os.environ.get("OCR_CROP_TOP_PCT", "0.25"))
+OCR_CROP_TOP_PCT = float(os.environ.get("OCR_CROP_TOP_PCT", "0.50"))
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +102,16 @@ def extract_text_per_page(pdf_bytes: bytes, ocr_mode: str = "auto") -> tuple[lis
 
     ocr_texts = []
     for img in images:
+        # Auto-detect and correct page orientation before OCR.
+        # Scanned documents are sometimes rotated 90/180/270 degrees.
+        try:
+            osd = pytesseract.image_to_osd(img)
+            angle = int(osd.split("Rotate: ")[1].split("\n")[0])
+            if angle:
+                img = img.rotate(-angle, expand=True)
+        except Exception:
+            pass  # OSD can fail on blank or low-contrast pages
+
         # Crop to top portion only — references (order numbers, vrachtbrief
         # numbers etc.) are virtually always in the page header. This cuts
         # OCR time by ~80% compared to scanning the full page.
@@ -137,8 +147,10 @@ def find_references(
 
         match = compiled.search(search_text)
         if match:
-            # Use first capture group if available, otherwise full match
+            # Use first capture group if available, otherwise full match.
+            # Strip internal whitespace (OCR sometimes splits digits).
             ref = match.group(1) if match.lastindex and match.lastindex >= 1 else match.group()
+            ref = re.sub(r'\s+', '', ref)
             matches.append({"page_index": page_idx, "reference": ref})
         else:
             matches.append(None)
