@@ -399,14 +399,26 @@ def split_pdf_handler(request):
 
     try:
         if "multipart/form-data" in content_type:
-            # Accept field name "file", "file[]", or "files"
+            # Accept any file field name — try known names first,
+            # then fall back to the first file field in the request.
             files = (
                 request.files.getlist("file")
                 or request.files.getlist("file[]")
                 or request.files.getlist("files")
             )
             if not files:
-                return make_error("Missing 'file' in form data", "MISSING_FILE")
+                # Fall back: grab files from whatever field name was used
+                for key in request.files:
+                    files = request.files.getlist(key)
+                    if files:
+                        break
+            if not files:
+                return make_error(
+                    "Missing file in form data. "
+                    f"Received fields: {list(request.form.keys())}, "
+                    f"file fields: {list(request.files.keys())}",
+                    "MISSING_FILE",
+                )
             if len(files) == 1:
                 pdf_bytes = files[0].read()
                 filename = files[0].filename or filename
