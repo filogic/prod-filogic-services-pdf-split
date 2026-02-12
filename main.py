@@ -15,7 +15,7 @@ import json
 import os
 import re
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import pdfplumber
 from pypdf import PdfReader, PdfWriter
@@ -43,7 +43,6 @@ except ImportError:
 # Config
 # ---------------------------------------------------------------------------
 GCS_BUCKET = os.environ.get("GCS_BUCKET", "pdf-splitter-output")
-SIGNED_URL_EXPIRY_MINUTES = int(os.environ.get("SIGNED_URL_EXPIRY_MINUTES", "60"))
 MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "20"))
 OUTPUT_PREFIX = os.environ.get("OUTPUT_PREFIX", "splits")
 
@@ -251,29 +250,20 @@ def upload_to_gcs(
     split_pdfs: dict[str, bytes],
     batch_id: str,
 ) -> list[dict]:
-    """Upload split PDFs to GCS and return signed URLs."""
+    """Upload split PDFs to GCS and return GCS paths."""
     client = storage.Client()
     bucket = client.bucket(GCS_BUCKET)
     results = []
 
     for reference, pdf_bytes in split_pdfs.items():
-        # Sanitize reference for use as filename
         safe_ref = re.sub(r'[^\w\-.]', '_', reference)
         blob_name = f"{OUTPUT_PREFIX}/{batch_id}/{safe_ref}.pdf"
         blob = bucket.blob(blob_name)
 
         blob.upload_from_string(pdf_bytes, content_type="application/pdf")
 
-        # Generate signed URL
-        signed_url = blob.generate_signed_url(
-            version="v4",
-            expiration=timedelta(minutes=SIGNED_URL_EXPIRY_MINUTES),
-            method="GET",
-        )
-
         results.append({
             "reference": reference,
-            "file_url": signed_url,
             "gcs_path": f"gs://{GCS_BUCKET}/{blob_name}",
             "file_size_bytes": len(pdf_bytes),
         })
@@ -475,7 +465,6 @@ def split_pdf_handler(request):
                 "reference": ref,
                 "pages": pages,
                 "page_count": len(pages),
-                "file_url": upload_info["file_url"],
                 "gcs_path": upload_info["gcs_path"],
                 "file_size_bytes": upload_info["file_size_bytes"],
             })
@@ -488,7 +477,6 @@ def split_pdf_handler(request):
             "documents": documents,
             "unmatched_pages": unmatched_pages,
             "extraction_method": extraction_method,
-            "signed_url_expires_in_minutes": SIGNED_URL_EXPIRY_MINUTES,
         })
 
     except Exception as e:
