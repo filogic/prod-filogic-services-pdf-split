@@ -160,15 +160,19 @@ def extract_text_per_page(
         # auto mode: return empty texts
         return texts, "text", None
 
-    # ── First pass: parallel cropped OCR (no OSD) ─────────────
+    # ── First pass: cropped OCR per page (sequential) ──────────
+    # Tesseract is not thread-safe on all platforms (can deadlock in
+    # Docker/Linux when called from multiple threads simultaneously).
+    # Sequential processing is reliable; speed comes from the small
+    # crop (top 25%) which keeps per-page OCR fast.
     t0 = time.time()
-    with ThreadPoolExecutor(max_workers=OCR_WORKERS) as pool:
-        results = list(pool.map(_ocr_one_page, images))
-    log.info("First pass OCR: %.1fs (%d pages, %d workers)",
-             time.time() - t0, len(images), OCR_WORKERS)
-
-    ocr_texts = [r[0] for r in results]
-    page_images = [r[1] for r in results]  # originals (not rotated yet)
+    ocr_texts = []
+    page_images = []
+    for i, img in enumerate(images):
+        text, orig = _ocr_one_page(img)
+        ocr_texts.append(text)
+        page_images.append(orig)
+    log.info("First pass OCR: %.1fs (%d pages)", time.time() - t0, len(images))
 
     return ocr_texts, "ocr", page_images
 
@@ -550,28 +554,40 @@ def split_pdf_handler(request):
         # 2b. For OCR pages with no match, retry with full-page OCR.
         #     The first pass only scanned a cropped top portion — pages
         #     with the reference below the crop or rotated pages will
-        #     have been missed.  We retry ALL unmatched pages; the retry
-        #     function decides per-page whether to also try rotations
-        #     based on how much text the first pass produced.
+        #     have been missed.
+        #
+        #     We only retry pages that are *likely* to carry a reference:
+        #       a) Pages with very little text (< 200 chars from crop) —
+        #          these are probably rotated and need orientation fixing.
+        #       b) Pages whose cropped text contains reference-like keywords
+        #          (e.g. "vrachtbrief", "delivery") — the number is probably
+        #          just below the 25% crop line.
+        #     Pages with lots of text but no keywords are detail/table
+        #     pages that genuinely don't have a reference → skip them.
+        _REF_HINTS = re.compile(
+            r"vrachtbrief|vrachtnota|delivery|reference|shipment|"
+            r"zending|vrachtbr|consignment|no\.",
+            re.IGNORECASE,
+        )
         if corrected_images:
             retry_indices = [
                 idx for idx, match in enumerate(per_page_matches)
-                if match is None and idx < len(corrected_images)
+                if match is None
+                and idx < len(corrected_images)
+                and (len(page_texts[idx].strip()) < 200
+                     or _REF_HINTS.search(page_texts[idx]))
             ]
             if retry_indices:
                 log.info("Retry OCR for %d unmatched pages: %s",
                          len(retry_indices), retry_indices)
-                retry_args = [
-                    (corrected_images[i], page_texts[i])
-                    for i in retry_indices
-                ]
                 t0 = time.time()
-                with ThreadPoolExecutor(max_workers=OCR_WORKERS) as pool:
-                    retry_results = list(pool.map(_ocr_retry_page, retry_args))
-                log.info("Retry OCR done: %.1fs", time.time() - t0)
-                for idx, (full_text, corrected_img) in zip(retry_indices, retry_results):
+                for idx in retry_indices:
+                    full_text, corrected_img = _ocr_retry_page(
+                        (corrected_images[idx], page_texts[idx])
+                    )
                     page_texts[idx] = full_text
                     corrected_images[idx] = corrected_img
+                log.info("Retry OCR done: %.1fs", time.time() - t0)
                 # Re-run reference matching with the updated texts
                 per_page_matches = find_references(
                     page_texts, reference_pattern, search_area
