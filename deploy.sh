@@ -39,6 +39,8 @@ gcloud run deploy "${SERVICE_NAME}" \
     --region "${REGION}" \
     --allow-unauthenticated \
     --memory 2Gi \
+    --cpu 2 \
+    --concurrency 1 \
     --timeout 300s \
     --max-instances 10 \
     --set-env-vars "GCS_BUCKET=${GCS_BUCKET}"
