@@ -57,7 +57,10 @@ OCR_CROP_TOP_PCT = float(os.environ.get("OCR_CROP_TOP_PCT", "0.50"))
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def extract_text_per_page(pdf_bytes: bytes, ocr_mode: str = "auto") -> tuple[list[str], str]:
+def extract_text_per_page(
+    pdf_bytes: bytes,
+    ocr_mode: str = "auto",
+) -> tuple[list[str], str, list | None]:
     """
     Extract text from each page.
 
@@ -66,7 +69,11 @@ def extract_text_per_page(pdf_bytes: bytes, ocr_mode: str = "auto") -> tuple[lis
       - "force": Always use OCR (for scanned documents).
       - "off": Only use pdfplumber (no OCR).
 
-    Returns (page_texts, method_used) where method_used is "text" or "ocr".
+    Returns (page_texts, method_used, corrected_images) where:
+      - method_used is "text" or "ocr"
+      - corrected_images is a list of orientation-corrected PIL images
+        when OCR was used (None otherwise).  These can be re-used for
+        full-page OCR retries on unmatched pages.
     """
     # ── Try text extraction first (unless force OCR) ──────────
     if ocr_mode != "force":
@@ -79,7 +86,7 @@ def extract_text_per_page(pdf_bytes: bytes, ocr_mode: str = "auto") -> tuple[lis
         # If we got meaningful text, use it
         has_text = any(len(t.strip()) > 10 for t in texts)
         if has_text or ocr_mode == "off":
-            return texts, "text"
+            return texts, "text", None
 
     # ── Fall back to OCR ──────────────────────────────────────
     if not OCR_AVAILABLE:
@@ -90,7 +97,7 @@ def extract_text_per_page(pdf_bytes: bytes, ocr_mode: str = "auto") -> tuple[lis
             )
         # auto mode: return empty texts with a warning — the caller will
         # report NO_REFERENCES_FOUND with a helpful hint
-        return texts, "text"
+        return texts, "text", None
 
     try:
         images = convert_from_bytes(pdf_bytes, dpi=OCR_DPI)
@@ -98,8 +105,9 @@ def extract_text_per_page(pdf_bytes: bytes, ocr_mode: str = "auto") -> tuple[lis
         if ocr_mode == "force":
             raise RuntimeError(f"OCR failed: {e}. Is poppler-utils installed?")
         # auto mode: return empty texts
-        return texts, "text"
+        return texts, "text", None
 
+    corrected_images = []
     ocr_texts = []
     for img in images:
         # Auto-detect and correct page orientation before OCR.
@@ -112,16 +120,25 @@ def extract_text_per_page(pdf_bytes: bytes, ocr_mode: str = "auto") -> tuple[lis
         except Exception:
             pass  # OSD can fail on blank or low-contrast pages
 
+        corrected_images.append(img)
+
         # Crop to top portion only — references (order numbers, vrachtbrief
         # numbers etc.) are virtually always in the page header. This cuts
         # OCR time by ~80% compared to scanning the full page.
         if OCR_CROP_TOP_PCT < 1.0:
             w, h = img.size
-            img = img.crop((0, 0, w, int(h * OCR_CROP_TOP_PCT)))
-        text = pytesseract.image_to_string(img, lang=OCR_LANGUAGES)
+            cropped = img.crop((0, 0, w, int(h * OCR_CROP_TOP_PCT)))
+        else:
+            cropped = img
+        text = pytesseract.image_to_string(cropped, lang=OCR_LANGUAGES)
         ocr_texts.append(text)
 
-    return ocr_texts, "ocr"
+    return ocr_texts, "ocr", corrected_images
+
+
+def ocr_full_page(img) -> str:
+    """Run OCR on a full (uncropped) orientation-corrected page image."""
+    return pytesseract.image_to_string(img, lang=OCR_LANGUAGES)
 
 
 def find_references(
@@ -443,7 +460,9 @@ def split_pdf_handler(request):
     # ---- Process ----
     try:
         # 1. Extract text from each page (with OCR fallback)
-        page_texts, extraction_method = extract_text_per_page(pdf_bytes, ocr_mode)
+        page_texts, extraction_method, corrected_images = extract_text_per_page(
+            pdf_bytes, ocr_mode
+        )
         total_pages = len(page_texts)
 
         if total_pages == 0:
@@ -451,6 +470,21 @@ def split_pdf_handler(request):
 
         # 2. Find references per page
         per_page_matches = find_references(page_texts, reference_pattern, search_area)
+
+        # 2b. For OCR pages with no match, retry with full-page OCR.
+        #     The initial OCR only scans the top portion of each page
+        #     for speed; some documents have references lower on the
+        #     page.  Re-OCR only the unmatched pages (full page) to
+        #     avoid slowing down the common case.
+        if corrected_images and OCR_CROP_TOP_PCT < 1.0:
+            for idx, match in enumerate(per_page_matches):
+                if match is None and idx < len(corrected_images):
+                    full_text = ocr_full_page(corrected_images[idx])
+                    page_texts[idx] = full_text
+            # Re-run reference matching with the updated texts
+            per_page_matches = find_references(
+                page_texts, reference_pattern, search_area
+            )
 
         if not any(m is not None for m in per_page_matches):
             hint = ""
