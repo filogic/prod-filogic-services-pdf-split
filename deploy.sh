@@ -41,6 +41,7 @@ gcloud run deploy "${SERVICE_NAME}" \
     --memory 2Gi \
     --cpu 2 \
     --concurrency 1 \
+    --execution-environment gen2 \
     --cpu-boost \
     --min-instances 0 \
     --timeout 300s \
