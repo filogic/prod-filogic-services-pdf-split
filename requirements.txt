@@ -1,0 +1,8 @@
+functions-framework==3.*
+pypdf==4.*
+pdfplumber==0.11.*
+google-cloud-storage==2.*
+
+# OCR support (optional — needed for scanned PDFs)
+pytesseract==0.3.*
+pdf2image==1.*
