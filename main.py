@@ -8,6 +8,7 @@ Deploy:
   export GCP_PROJECT_ID=my-project
   ./deploy.sh
 """
+from __future__ import annotations
 
 import functions_framework
 import io
@@ -153,9 +154,12 @@ def group_pages_by_reference(
     """
     Group pages into documents based on where references are found.
 
-    Key behaviour: a new document is created only when the reference
-    *changes*.  Continuation pages (same ref or no ref) are appended to
-    the current document.
+    Each page is assigned to the reference it carries. Pages without a
+    match are assigned to the *current* reference only as long as no new
+    (different) reference appears later — i.e. they are "continuation"
+    pages.  However, trailing pages at the end of the document that carry
+    no reference, or pages sandwiched between two *different* references,
+    are collected as unmatched.
 
     split_mode:
       - 'before_reference': A new document starts AT the page where a
@@ -166,61 +170,80 @@ def group_pages_by_reference(
 
     Returns:
       - documents: {reference: [page_numbers (1-based)]}
-      - unmatched_pages: [page_numbers (1-based)] for pages before the
-        first reference
+      - unmatched_pages: [page_numbers (1-based)] for pages that could
+        not be attributed to any reference
     """
-    # Determine split points: pages where the reference CHANGES
-    split_points: list[dict] = []  # {page_index, reference}
-    current_ref = None
-
-    for entry in per_page_matches:
-        if entry is not None and entry["reference"] != current_ref:
-            split_points.append(entry)
-            current_ref = entry["reference"]
-
-    if not split_points:
+    if not any(m is not None for m in per_page_matches):
         return {}, list(range(1, total_pages + 1))
 
+    # --- Build a per-page reference map ---
+    # For each page, determine which reference it belongs to.
+    # A page with an explicit match gets that reference.
+    # A page without a match is tentatively assigned to the preceding
+    # reference, but only if the *next* page with a match carries the
+    # same reference (i.e. it's a true continuation page).  Otherwise
+    # the page is unmatched.
+
+    # First, build a list of (page_index, reference) for pages that have
+    # an explicit match.
+    explicit: list[tuple[int, str]] = []
+    for entry in per_page_matches:
+        if entry is not None:
+            explicit.append((entry["page_index"], entry["reference"]))
+
+    # For every page, look up the *next* explicit reference at or after
+    # that page, and the *previous* explicit reference at or before it.
+    # Pre-compute prev_ref and next_ref arrays for O(n) lookup.
+    prev_ref: list[str | None] = [None] * total_pages
+    next_ref: list[str | None] = [None] * total_pages
+
+    last = None
+    for i in range(total_pages):
+        if per_page_matches[i] is not None:
+            last = per_page_matches[i]["reference"]
+        prev_ref[i] = last
+
+    last = None
+    for i in range(total_pages - 1, -1, -1):
+        if per_page_matches[i] is not None:
+            last = per_page_matches[i]["reference"]
+        next_ref[i] = last
+
+    # Now assign each page.
+    page_assignment: list[str | None] = [None] * total_pages
+
+    for i in range(total_pages):
+        match = per_page_matches[i]
+        if match is not None:
+            # Page has an explicit reference
+            page_assignment[i] = match["reference"]
+        else:
+            # No match — assign to the preceding reference only if the
+            # next explicit reference is the same (true continuation).
+            # Trailing pages (where next_ref is None) are NOT absorbed;
+            # they become unmatched / "unknown".
+            pr = prev_ref[i]
+            nr = next_ref[i]
+            if pr is not None and nr == pr:
+                page_assignment[i] = pr
+            # else: stays None → unmatched
+
+    # --- Collect into documents and unmatched ---
     documents: dict[str, list[int]] = {}
     unmatched_pages: list[int] = []
-    seen_refs: dict[str, int] = {}  # track duplicates
+    seen_refs: dict[str, int] = {}
 
-    if split_mode == "before_reference":
-        # Pages before the first split point are unmatched
-        first_page = split_points[0]["page_index"]
-        if first_page > 0:
-            unmatched_pages = list(range(1, first_page + 1))
-
-        for i, sp in enumerate(split_points):
-            start = sp["page_index"]
-            end = split_points[i + 1]["page_index"] if i + 1 < len(split_points) else total_pages
-            pages = list(range(start + 1, end + 1))  # 1-based
-
-            ref = sp["reference"]
-            if ref in seen_refs:
-                seen_refs[ref] += 1
-                ref = f"{ref}_{seen_refs[ref]}"
-            else:
+    for i in range(total_pages):
+        ref = page_assignment[i]
+        if ref is None:
+            unmatched_pages.append(i + 1)  # 1-based
+        else:
+            # Handle duplicate reference names (e.g. same order number
+            # appearing in two non-contiguous groups).
+            if ref not in seen_refs:
                 seen_refs[ref] = 1
-            documents[ref] = pages
-
-    elif split_mode == "after_reference":
-        first_page = split_points[0]["page_index"]
-        if first_page > 0:
-            unmatched_pages = list(range(1, first_page + 1))
-
-        for i, sp in enumerate(split_points):
-            start = sp["page_index"] + 1  # start AFTER the separator page
-            end = split_points[i + 1]["page_index"] if i + 1 < len(split_points) else total_pages
-            pages = list(range(start + 1, end + 1)) if start < end else []  # 1-based
-
-            ref = sp["reference"]
-            if ref in seen_refs:
-                seen_refs[ref] += 1
-                ref = f"{ref}_{seen_refs[ref]}"
-            else:
-                seen_refs[ref] = 1
-            documents[ref] = pages
+                documents[ref] = []
+            documents[ref].append(i + 1)  # 1-based
 
     return documents, unmatched_pages
 
@@ -446,6 +469,10 @@ def split_pdf_handler(request):
         page_groups, unmatched_pages = group_pages_by_reference(
             per_page_matches, total_pages, split_mode
         )
+
+        # 3b. Include unmatched pages as "unknown"
+        if unmatched_pages:
+            page_groups["unknown"] = unmatched_pages
 
         # 4. Split the PDF
         split_pdfs = split_pdf(pdf_bytes, page_groups)
