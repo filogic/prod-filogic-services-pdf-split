@@ -10,10 +10,10 @@
 #   ./deploy.sh
 set -euo pipefail
 
-PROJECT_ID="${GCP_PROJECT_ID:?Set GCP_PROJECT_ID}"
-REGION="${GCP_REGION:-europe-west1}"
-GCS_BUCKET="${GCS_BUCKET:-pdf-splitter-output}"
-SERVICE_NAME="split-pdf"
+PROJECT_ID="${GCP_PROJECT_ID:-filogic-opentms}"
+REGION="${GCP_REGION:-europe-west4}"
+GCS_BUCKET="${GCS_BUCKET:-filogic-opentms-tmp}"
+SERVICE_NAME="prod-filogic-services-pdf-split"
 
 # ── GCS bucket met auto-cleanup ────────────────────────────
 echo "📦 Ensuring GCS bucket: ${GCS_BUCKET}"

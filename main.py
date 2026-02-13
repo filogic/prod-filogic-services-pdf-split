@@ -43,7 +43,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-GCS_BUCKET = os.environ.get("GCS_BUCKET", "pdf-splitter-output")
+GCS_BUCKET = os.environ.get("GCS_BUCKET", "filogic-opentms-tmp")
 MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "20"))
 
 
