@@ -78,6 +78,7 @@ def _ocr_one_page(img):
 
 
 OCR_RETRY_DPI = int(os.environ.get("OCR_RETRY_DPI", "150"))
+OCR_MAX_RETRY_PAGES = int(os.environ.get("OCR_MAX_RETRY_PAGES", "10"))
 
 
 def _ocr_retry_page(pdf_bytes, page_index, cropped_text):
@@ -130,17 +131,22 @@ def extract_text_per_page(
         full-page OCR retries on unmatched pages.
     """
     # ── Try text extraction first (unless force OCR) ──────────
+    texts = []
     if ocr_mode != "force":
-        texts = []
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             for page in pdf.pages:
                 text = page.extract_text() or ""
                 texts.append(text)
 
-        # If we got meaningful text, use it
-        has_text = any(len(t.strip()) > 10 for t in texts)
-        if has_text or ocr_mode == "off":
+        non_empty = [i for i, t in enumerate(texts) if len(t.strip()) > 10]
+        all_have_text = len(non_empty) == len(texts)
+
+        # If ALL pages have text, no OCR needed
+        if all_have_text or ocr_mode == "off":
             return texts, "text", None
+
+        # If NO pages have text, do full OCR (below)
+        # If SOME pages have text (mixed doc), OCR only the empty pages
 
     # ── Fall back to OCR ──────────────────────────────────────
     if not OCR_AVAILABLE:
@@ -149,9 +155,17 @@ def extract_text_per_page(
                 "OCR is not available. Install poppler-utils and pytesseract, "
                 "or deploy with Docker (see Dockerfile)."
             )
-        # auto mode: return empty texts with a warning — the caller will
-        # report NO_REFERENCES_FOUND with a helpful hint
         return texts, "text", None
+
+    # Determine which pages need OCR
+    empty_indices = set()
+    if texts:
+        empty_indices = {i for i, t in enumerate(texts) if len(t.strip()) <= 10}
+        if not empty_indices:
+            return texts, "text", None
+        log.info("Mixed document: %d/%d pages need OCR: %s",
+                 len(empty_indices), len(texts),
+                 sorted(i + 1 for i in empty_indices))
 
     try:
         t0 = time.time()
@@ -160,8 +174,7 @@ def extract_text_per_page(
     except Exception as e:
         if ocr_mode == "force":
             raise RuntimeError(f"OCR failed: {e}. Is poppler-utils installed?")
-        # auto mode: return empty texts
-        return texts, "text", None
+        return texts or [""] * 0, "text", None
 
     # ── First pass: cropped OCR per page (sequential) ──────────
     # Tesseract is not thread-safe on all platforms (can deadlock in
@@ -171,11 +184,19 @@ def extract_text_per_page(
     t0 = time.time()
     ocr_texts = []
     page_images = []
+    ocr_count = 0
     for i, img in enumerate(images):
-        text, orig = _ocr_one_page(img)
-        ocr_texts.append(text)
-        page_images.append(orig)
-    log.info("First pass OCR: %.1fs (%d pages)", time.time() - t0, len(images))
+        if empty_indices and i not in empty_indices:
+            # Page already has good text from pdfplumber — skip OCR
+            ocr_texts.append(texts[i])
+            page_images.append(img)
+        else:
+            text, orig = _ocr_one_page(img)
+            ocr_texts.append(text)
+            page_images.append(orig)
+            ocr_count += 1
+    log.info("First pass OCR: %.1fs (%d pages OCR'd of %d total)",
+             time.time() - t0, ocr_count, len(images))
 
     return ocr_texts, "ocr", page_images
 
@@ -580,6 +601,11 @@ def split_pdf_handler(request):
                 and (len(page_texts[idx].strip()) < 200
                      or _REF_HINTS.search(page_texts[idx]))
             ]
+            # Cap retries to avoid excessive processing on large docs
+            if len(retry_indices) > OCR_MAX_RETRY_PAGES:
+                log.info("Capping retry from %d to %d pages",
+                         len(retry_indices), OCR_MAX_RETRY_PAGES)
+                retry_indices = retry_indices[:OCR_MAX_RETRY_PAGES]
             if retry_indices:
                 log.info("Retry OCR for %d unmatched pages at %d DPI: %s",
                          len(retry_indices), OCR_RETRY_DPI, retry_indices)
